@@ -346,8 +346,10 @@ def judge_seed(run, s, steps, intent, lock, baseline=None, full=False):
                          'step at level 2\n' if added else ''))
             log.flush()
             ts = time.time()
+            _extra = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
             rc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT,
-                                env=dict(os.environ, **knobs) if knobs else None).returncode
+                                env=dict(os.environ, **knobs) if knobs else None,
+                                **_extra).returncode
             log.write(f'# exit {rc} in {time.time() - ts:.1f} s\n')
             log.flush()
             res['steps'].append({'step': i, 'exit': rc, 'quick_added': added})
@@ -369,7 +371,8 @@ def judge_seed(run, s, steps, intent, lock, baseline=None, full=False):
         with open(log_path, 'a', encoding='utf-8') as log:
             log.write(f"$ {' '.join(shlex.quote(a) for a in qs)}\n")
             log.flush()
-            rc = subprocess.run(qs, stdout=log, stderr=subprocess.STDOUT).returncode
+            _extra = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+            rc = subprocess.run(qs, stdout=log, stderr=subprocess.STDOUT, **_extra).returncode
         try:
             with open(score, encoding='utf-8') as fh:
                 res['score'] = json.load(fh)
@@ -532,6 +535,18 @@ def main(argv=None):
     ap.add_argument('--jobs', type=int, default=1,
                     help='seeds routed at once (default 1: a judging route takes up to about '
                          '1.3 GB on a small board and 5 GB on a 350-part one)')
+    ap.add_argument('--diverse', choices=('off', 'auto', 'farthest', 'medoid'), default='off',
+                    help='re-select seeds from the full legal placement pool in judge.json '
+                         'by macro geometric diversity before routing (default: off)')
+    ap.add_argument('--diverse-count', type=int, default=None,
+                    help='with --diverse: how many seeds to select (default: len(judge.json.judge))')
+    ap.add_argument('--diverse-cost-cap', type=float, default=1.20,
+                    help='with --diverse: max proxy cost ratio vs tier best (default: 1.20)')
+    ap.add_argument('--diverse-quality-weight', type=float, default=0.15,
+                    help='with --diverse farthest: normalized cost tie-break penalty (default: 0.15)')
+    ap.add_argument('--no-diff-pair-warn', action='store_true',
+                    help='suppress regex-based differential-pair name warnings (e.g. analog '
+                         'single-ended /V_GP & /V_GN nets when policy forbids regex diff pairs)')
     a = ap.parse_args(argv)
     from placement import run_record              # the placement record (#1486)
     run_record.record('judge_seeds', argv)
@@ -553,6 +568,7 @@ def main(argv=None):
     except (OSError, ValueError, TypeError, AttributeError) as ex:
         print(f'judge_seeds: cannot read {a.judge}: {ex}', file=sys.stderr)
         return 2
+    diversity_diag = None
     if a.seeds:
         from place_simple import _seed_list
         try:
@@ -561,6 +577,55 @@ def main(argv=None):
             print(f'judge_seeds: --seeds {a.seeds!r} is not a list like 0-3 or 0,1,5',
                   file=sys.stderr)
             return 2
+    elif a.diverse != 'off':
+        from placement.diversity import load_seed_costs_from_run, select_diverse_from_run_dir
+        illegal_set = {int(s) for s in (doc.get('illegal') or ())}
+        pool_raw = []
+        for key in ('scattered', 'clustered', 'anchored'):
+            for s in doc.get(key) or ():
+                si = int(s)
+                if si not in illegal_set and si not in pool_raw:
+                    pool_raw.append(si)
+        if not pool_raw:
+            pool_raw = list(named)
+        # Keep only seeds that have placement boards on disk
+        pool_raw = [s for s in pool_raw if os.path.isfile(os.path.join(run, f's{s}.kicad_pcb'))]
+        fp_map = doc.get('floorplan') or {}
+        asm_map = doc.get('assembly') or {}
+        costs_raw = {int(k): float(v) for k, v in (doc.get('costs') or {}).items()
+                     if v is not None}
+        if len(costs_raw) < len(pool_raw):
+            log_costs = load_seed_costs_from_run(run, pool_raw)
+            for s, c in log_costs.items():
+                costs_raw.setdefault(s, c)
+        tiers = {}
+        for s in pool_raw:
+            e = fp_map.get(str(s))
+            b = asm_map.get(str(s))
+            tiers[s] = (e is None or b is None, (e or 0) + (b or 0))
+        ranked_pool = sorted(
+            pool_raw,
+            key=lambda s: (tiers[s][0], tiers[s][1], costs_raw.get(s, float('inf')), s),
+        )
+        unclean_pool = placement_defects(doc, ranked_pool)
+        clean_pool = [s for s in ranked_pool if s not in unclean_pool]
+        k_div = a.diverse_count if a.diverse_count is not None else max(len(named), 1)
+        if clean_pool:
+            named, diversity_diag = select_diverse_from_run_dir(
+                run,
+                clean_pool,
+                k_div,
+                mode=a.diverse,
+                costs=costs_raw,
+                tiers=tiers,
+                cost_cap_ratio=a.diverse_cost_cap,
+                quality_weight=a.diverse_quality_weight,
+            )
+            print(f"judge_seeds: diversity ({a.diverse}, k={k_div}, pool={len(clean_pool)}): "
+                  f"selected {named} (vs cost top-{k_div} {diversity_diag.get('baseline_top_k')}; "
+                  f"IC mean dist {diversity_diag.get('baseline_ic_mean_mm')} -> "
+                  f"{diversity_diag.get('selected_ic_mean_mm')} mm, "
+                  f"{diversity_diag.get('ic_mean_gain_pct'):+.1f}%)")
     if not named:
         ill = doc.get('illegal') or []
         print(f"judge_seeds: {a.judge} names no seed to judge"
@@ -605,7 +670,8 @@ def main(argv=None):
           + (', at the full level (--full: no level-2 pass)' if a.full else ''))
     if not a.intent:
         print('  NOTE: no --intent: quick_score leaves the floorplan ungraded')
-    pairs = unpaired_diff_pairs(os.path.join(run, f's{named[0]}.kicad_pcb'), steps)
+    pairs = [] if a.no_diff_pair_warn else unpaired_diff_pairs(
+        os.path.join(run, f's{named[0]}.kicad_pcb'), steps)
     if pairs:
         print(f"  WARNING: the board has {len(pairs)} differential pair(s) by name (e.g. "
               f"{pairs[0][0]} / {pairs[0][1]}) and no chain step runs route_diff.py: route.py "
@@ -717,7 +783,8 @@ def main(argv=None):
         # blocked at level 2 ([] at the 1-net band or with one seed in it)
         'not_separable': apart,
         'confirmed': [r['seed'] for r in confirmed],
-        'best': best}))
+        'best': best,
+        **({'diversity': diversity_diag} if diversity_diag is not None else {})}))
     return 4 if failed else 0
 
 

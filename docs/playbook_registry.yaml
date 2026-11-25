@@ -1,0 +1,403 @@
+# AI4PCB x KiCadRoutingTools Structured Improvement Registry (SSOT)
+# Synced 1-to-1 with docs/AI4PCB_IMPROVEMENT_PLAYBOOK.md
+schema_version: 1
+updated_at: "2026-11-25"
+repository:
+  fork_path: "Tools/KiCadRoutingTools"
+  branch: "ai4pcb/main"
+  upstream_repo: "https://github.com/drandyhaas/KiCadRoutingTools.git"
+  upstream_base_commit: "61565f3"
+  origin_remote: "https://github.com/chinayuren2022-2025/KiCadRoutingTools.git"
+
+status_enum:
+  - VERIFIED           # Implemented, unit-tested, and proven via paired A/B
+  - CONDITIONAL        # Implemented & tested; positive only under gated preconditions
+  - DIAGNOSED_BACKLOG  # Root-caused with concrete fix spec; queued for implementation
+  - PLANNED            # Architectural roadmap item
+
+pipeline_stages:
+  - id: S0
+    name: "机械边界锁定与路线 B 约束编译"
+    input_artifacts: ["board.yaml", "raw.kicad_pcb"]
+    output_artifacts: ["fixed.kicad_pcb", "routing_policy.json", "compiled_constraints.json", "judge_chain.txt"]
+  - id: S1
+    name: "功能拓扑分组与意图契约校验"
+    input_artifacts: ["fixed.kicad_pcb", "compiled_constraints.json"]
+    output_artifacts: ["groups.json", "intent.json"]
+  - id: S2
+    name: "宏观流场初值、物理硬约束与有界局部退火"
+    input_artifacts: ["fixed.kicad_pcb", "groups.json", "intent.json", "physics_constraints.json"]
+    output_artifacts: ["s{0..N-1}.kicad_pcb", "judge.json"]
+  - id: S3
+    name: "几何多样性筛选与两级并行布线择优"
+    input_artifacts: ["s{0..N-1}.kicad_pcb", "judge.json", "judge_chain.txt"]
+    output_artifacts: ["s{best}.kicad_pcb", "s{best}_full.kicad_pcb", "s{best}_full.score.json"]
+  - id: S4
+    name: "确定性布线策略与模拟/高速规则"
+    input_artifacts: ["s{best}.kicad_pcb", "routing_policy.json"]
+    output_artifacts: ["routed.kicad_pcb", "route.json"]
+  - id: S5
+    name: "确定性模拟收尾原语与真 DRC/DFM 硬门禁"
+    input_artifacts: ["routed.kicad_pcb", "compiled_constraints.json"]
+    output_artifacts: ["delivered.kicad_pcb", "delivered.drc.json", "delivered.audit.json"]
+  - id: S6
+    name: "布线失败/拥堵热力图回灌闭环与 Agent Harness"
+    input_artifacts: ["routed.kicad_pcb", "route.json"]
+    output_artifacts: ["feedback.json", "feedback_constraints.json", "refined.kicad_pcb"]
+  - id: S7
+    name: "工程基础设施性能、跨平台稳定性与多板回归"
+    input_artifacts: ["KRT runtime", "PCB_Reference_Corpus"]
+    output_artifacts: ["benchmark_reports", "ci_regression_results"]
+
+modifications:
+  - id: MOD-S0-01
+    stage: S0
+    name: "路线 B `board.yaml` 确定性约束编译器"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_tools/compile_board_constraints.py"
+        symbols: ["compile_constraints", "render_judge_chain", "_infer_symmetry_from_connectors"]
+      - file: "py_placer/judge_seeds.py"
+        symbols: ["main (--no-diff-pair-warn)"]
+    cli_flags:
+      - "py_tools/compile_board_constraints.py <board.yaml> <pcb> --out-dir <dir> --same-net-pad-clearance 0.30"
+      - "py_placer/judge_seeds.py ... --no-diff-pair-warn"
+    baseline_failure: "LLM 手工抄写约束漏掉 /CHASSIS (退化至 0.20 mm) 与下游保护轨 /VCC_DUT /VEE_DUT；KRT 正则误将 /V_GP & /V_GN 判为差分对；unconnected-* 单焊盘网混入布线列表。"
+    mechanism: "直接编译 board.yaml + .kicad_pcb，确定性输出加宽电源/机壳网表、安全同网避让、热源/敏感器件集合、锁定连接器推导的 X/Y 平移向量及 forbid_regex_diff_pairs 策略。"
+    rollback: "不传 --board-yaml，回退手工编写 chain.txt。"
+    evidence:
+      experiment_ids: ["EXP-02", "EXP-03"]
+      key_deltas:
+        - metric: "power_and_chassis_omissions"
+          baseline: "3 nets missed/narrowed"
+          treatment: "0 missed (/CHASSIS 0.80mm, rails 0.65-0.80mm)"
+        - metric: "regex_diff_pair_false_positives"
+          baseline: "1 false pair (/V_GP & /V_GN)"
+          treatment: "0 (suppressed by policy)"
+    boundaries: "要求 board.yaml 遵循 GongLab 路线 B schema；无 board.yaml 的外部板可跳过并手写 chain.txt。"
+    regression_tests: ["tests/test_ai4pcb_constraints_and_harness.py"]
+
+  - id: MOD-S1-01
+    stage: S1
+    name: "前置契约预校验与原生早检 Courtyard DRC 门禁"
+    status: VERIFIED
+    priority: P1
+    risk: LOW
+    code_anchors:
+      - file: "py_tools/ai4pcb_harness.py"
+        symbols: ["cmd_place", "_early_courtyard_check"]
+    cli_flags:
+      - "py_tools/ai4pcb_harness.py place <work_dir> --groups <g> --intent <i> [--no-check-courtyard]"
+    baseline_failure: "分组漏件或意图格式错在耗时 60s+ 的退火后才暴露；布线后才发现封装 courtyard 碰撞导致整轮返工。"
+    mechanism: "退火前强制运行 check_groups.py / check_floorplan.py；退火后对入围种子立即跑不覆铜的 kicad-cli pcb drc (<2s/seed) 筛查 courtyard_overlap。"
+    rollback: "--skip-validate / --no-check-courtyard"
+    evidence:
+      experiment_ids: ["EXP-03"]
+      key_deltas:
+        - metric: "early_courtyard_check_latency"
+          baseline: "discovered after full route + zone refill (~5-10 min)"
+          treatment: "<2 s/seed right after placement (0/18 overlaps verified across Exp03)"
+    boundaries: "原生早检不执行覆铜，仅负责机械封装与板边冲突前置拦截，不替代 Stage 5 全量 DRC。"
+    regression_tests: ["tests/test_ai4pcb_constraints_and_harness.py"]
+
+  - id: MOD-S2-01
+    stage: S2
+    name: "增量硬物理约束（精确平移对称 + 自定义最小热隔离）与耦合对称移动"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_placer/placement/simple.py"
+        symbols: ["_hint_value", "_hint_full", "_hint_local"]
+      - file: "py_placer/placement/simple_anneal.py"
+        symbols: ["coupled symmetry move operator"]
+      - file: "py_placer/place_simple.py"
+        symbols: ["--constraints-json"]
+    cli_flags:
+      - "py_placer/place_simple.py ... --constraints-json <physics_constraints.json>"
+    baseline_failure: "上游退火缺少几何对称与自定义热隔离项；B01 自由布局 41 对 X/Y 通道平均失配 22.89 mm、最大 74.31 mm、朝向错乱 25/41，2512 功率电阻距精密 IC 仅 16.24 mm。"
+    mechanism: "在 O(1) 增量代价引擎加入 symmetry 与 apart_min 原语；SA 对称移动算子以 75% 概率同步平移/旋转配对器件、25% 概率允许单件合法化微调。"
+    rollback: "省略 --constraints-json 即 100% 退回上游行为。"
+    evidence:
+      experiment_ids: ["EXP-03"]
+      key_deltas:
+        - metric: "xy_41pair_mean_error_mm"
+          baseline: "22.89 mm (max 74.31 mm)"
+          treatment: "0.00 mm (max 0.00 mm across all 6 seeds)"
+        - metric: "xy_41pair_rot_mismatches"
+          baseline: "25.0 / 41"
+          treatment: "0.0 / 41"
+        - metric: "min_hot_to_sensitive_ic_mm"
+          baseline: "16.24 mm"
+          treatment: "24.17 mm (+48.8%)"
+        - metric: "min_hot_to_hot_mm"
+          baseline: "5.62 mm"
+          treatment: "11.12 mm (+97.9%)"
+    boundaries: "对称配对表需确保两侧子电路封装相同且板内有对应平移/镜像空间；过高权重会略升代理代价但不影响 0-blocking 可布通性。"
+    regression_tests: ["tests/test_ai4pcb_physics_and_feedback.py"]
+
+  - id: MOD-S2-02
+    stage: S2
+    name: "宏观信号流解析初值（--macro-flow）与有界局部退火（--local-radius）"
+    status: CONDITIONAL
+    priority: P1
+    risk: MEDIUM
+    code_anchors:
+      - file: "py_placer/placement/simple_anneal.py"
+        symbols: ["macro_flow initializer", "local_radius_mm clamp"]
+      - file: "py_placer/place_simple.py"
+        symbols: ["--macro-flow", "--keep-poses", "--local-radius", "--movable-only"]
+    cli_flags:
+      - "py_placer/place_simple.py ... --macro-flow [--local-radius MM]"
+      - "py_placer/place_simple.py ... --keep-poses --local-radius 8.0 --movable-only REF1,REF2"
+    baseline_failure: "强物理约束下纯随机初始化在非凸空间容易落入高代价局部盆地（B1 6 种子代价标准差 161.2，跨度 484.8）。"
+    mechanism: "依据锁定连接器位置构造低抖动二次信号流初值并预先对齐对称对中点；--local-radius 将退火位移限制在初始位姿半径内。"
+    rollback: "省略 --macro-flow / --local-radius。"
+    evidence:
+      experiment_ids: ["EXP-03"]
+      key_deltas:
+        - metric: "seed_proxy_cost_std"
+          baseline: "161.2 (span 484.8, Arm B1)"
+          treatment: "61.9 (-61.6%, span 189.6, Arm B2)"
+        - metric: "l2_blocking_with_tight_R18"
+          baseline: "0..6 (2/4 seeds 0-blk at L2, Arm B1)"
+          treatment: "4..7 at L2, 0-blk at FULL (Arm B2, R=18mm too tight for global detangling)"
+    boundaries: "全局首摆推荐使用 --macro-flow 而不加紧 --local-radius（或 R>=35mm）；紧半径 R=6..12mm 仅用于 Stage 6 局部精修。"
+    regression_tests: ["tests/test_ai4pcb_physics_and_feedback.py"]
+
+  - id: MOD-S3-01
+    stage: S3
+    name: "自适应几何多样性并行择优（--diverse auto）与两级全量确认"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_placer/placement/diversity.py"
+        symbols: ["extract_pose_signature", "pairwise_distances", "select_diverse_seeds", "select_diverse_from_run_dir"]
+      - file: "py_placer/place_simple.py"
+        symbols: ["--diverse", "--diverse-cost-cap", "--diverse-quality-weight"]
+      - file: "py_placer/judge_seeds.py"
+        symbols: ["--diverse", "--diverse-count", "--confirm close"]
+      - file: "py_tools/ai4pcb_harness.py"
+        symbols: ["cmd_judge (anti-lobotomy + auto full promote)"]
+    cli_flags:
+      - "py_placer/place_simple.py ... --judge 6 --diverse auto"
+      - "py_placer/judge_seeds.py ... --confirm close --jobs 6"
+    baseline_failure: "pcb_agent_harness.py 阉割为单选 judged_list[0]；上游 final.cost[:k] 在多块板上陷入同盆地重复布局并漏掉全量布线冠军；纯 farthest 在紧预设分区板上易选到小框角落离群点。"
+    mechanism: "按宏引脚权重计算可动器件位姿距离，严格保底缺陷分层与 0 号最低代价槽；auto 模式检测候选池 90 分位宏 IC 间距 p90_ic_mm：<10.5mm 切 medoid@1.10，>=10.5mm 用 farthest@1.20；配合 --confirm close 并行全量确认。"
+    rollback: "--diverse off"
+    evidence:
+      experiment_ids: ["EXP-01"]
+      key_deltas:
+        - metric: "oracle_top6_hit_rate_k4"
+          baseline: "16.7% (2/12 across 3 boards)"
+          treatment: "50.0% (6/12, 3.0x)"
+        - metric: "oracle_top6_hit_rate_k6"
+          baseline: "27.8% (5/18 across 3 boards)"
+          treatment: "50.0% (9/18, 1.8x)"
+        - metric: "confirm_close_reversal_rate"
+          baseline: "0% checked (single-seed lobotomy)"
+          treatment: "3/3 boards (100%) reversed L2->FULL winner"
+    boundaries: "需要至少生成 2x~3x 于 --judge 数量的候选种子（如 12~18 颗选 4~6 颗）以提供几何探索池。"
+    regression_tests:
+      - "tests/test_ai4pcb_geometric_diversity.py"
+      - "tests/test_1327_judge_seeds.py"
+      - "tests/test_1645_judge_clean_seeds.py"
+
+  - id: MOD-S4-01
+    stage: S4
+    name: "同网 SMD 焊盘过孔避让（--same-net-pad-clearance）与 20um 间距裕量"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_tools/compile_board_constraints.py"
+        symbols: ["default_same_net_pad_clearance_mm", "default_clearance_mm"]
+      - file: "py_router/route.py"
+        symbols: ["--same-net-pad-clearance", "--clearance", "--power-nets", "--power-nets-widths"]
+    cli_flags:
+      - "--same-net-pad-clearance 0.30 --clearance 0.22 --power-nets ... --power-nets-widths ..."
+    baseline_failure: "KRT 默认 SAME_NET_PAD_CLEARANCE=-1.0 在 B01 产生 50 处非 EP via-in-SMD 和 73 处 <0.30mm 擦边；--clearance 0.21 在 0.1mm 路由网格斜线段下偶发 0.1905~0.1977mm 亚 10um 违例。"
+    mechanism: "显式启用 --same-net-pad-clearance 0.25~0.30mm，并将路由间距设为 fab 规则 +0.02mm (0.22mm) 吸收网格离散误差。"
+    rollback: "改回 --same-net-pad-clearance -1.0。"
+    evidence:
+      experiment_ids: ["EXP-02", "EXP-03"]
+      key_deltas:
+        - metric: "non_ep_via_in_smd"
+          baseline: "50 (A0)"
+          treatment: "0 (-100%, A1/A2/A3)"
+        - metric: "non_ep_via_grazing_0p30mm"
+          baseline: "73 (A0)"
+          treatment: "1 (-98.6%, A3)"
+        - metric: "total_vias"
+          baseline: "169 (A0)"
+          treatment: "155 (-8.3%, A3)"
+    boundaries: "高密度 BGA / 0.4mm 间距板需按封装间隙调低至 0.15~0.20mm 并对 BGA 焊盘允许 VIPPO。"
+    regression_tests: ["tests/test_ai4pcb_constraints_and_harness.py"]
+
+  - id: MOD-S5-01
+    stage: S5
+    name: "确定性模拟收尾原语与手术刀 Pass-2 DRC 自愈（analog_finish.py）"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_tools/analog_finish.py"
+        symbols: ["enforce_zone_thermal_relief", "place_ep_thermal_vias", "place_smd_ground_escape_vias", "place_perimeter_stitching_vias", "center_tracks_on_vias", "_heal_drc_issues_locally", "audit_board"]
+    cli_flags:
+      - "\"C:/Program Files/KiCad/10.0/bin/python.exe\" py_tools/analog_finish.py <in> <out> --ground-net /AGND --ep-refs U1,U2,RN1,RN2 --ep-vias 4 --same-net-smd-clearance 0.25 --perimeter-pitch 15.0"
+      - "py_tools/analog_finish.py <pcb> <pcb> --audit-only"
+    baseline_failure: "LLM 手写 pcbnew 脚本为修 2 处细间距 IC starved_thermal 把全板外层地铜改成 THT_THERMAL（毁掉全部 0603 热焊盘）；漏打板边缝合孔；未处理被走线围困的孤立 SMD 地焊盘与浮铜孤岛。"
+    mechanism: "1) 锁定外层覆铜为 ZONE_CONNECTION_THERMAL 并开启 ISLAND_REMOVAL_MODE_ALWAYS；2) 打齐 EP 散热孔、安全 SMD 地孔+短引线、板边缝合孔并校准偏心过孔；3) Pass-2 读取 KiCad 10 DRC，对孤立 SMD 地焊盘自动补安全短引线/过孔，对 >=6 脚细间距 IC starved_thermal 局部设 SetLocalZoneConnection(FULL)，对 2 脚被动件 starved_thermal 改为 0.25mm 短引线+过孔并设 SetLocalZoneConnection(NONE) 保持零立碑热隔离。"
+    rollback: "不调用 finish，保留 route.py 输出板。"
+    evidence:
+      experiment_ids: ["EXP-02", "EXP-03"]
+      key_deltas:
+        - metric: "b01_dfm_flaws_count"
+          baseline: "5 / 5 flaws (Astra v1)"
+          treatment: "0 / 5 flaws (Exp02 A3: DRC 0/0/4, bad_therm=0, via_in_smd=0, perim=30, EP 4/4/4/4, 23.7s)"
+    boundaries: "依赖 KiCad 10 内置 Python (pcbnew) 与 kicad-cli；Pass-2 仅修复明确属于 ground_net 的孤立/热焊盘问题，绝不放宽异网间距规则。"
+    regression_tests: ["EXP-02 A1-A3 & EXP-03 B0-B2 KiCad 10 DRC signoff"]
+
+  - id: MOD-S6-01
+    stage: S6
+    name: "拥堵与失败热力图局部回灌精修（route_feedback.py + ai4pcb_harness.py）"
+    status: CONDITIONAL
+    priority: P1
+    risk: MEDIUM
+    code_anchors:
+      - file: "py_placer/placement/route_feedback.py"
+        symbols: ["analyze_routed_board", "build_feedback_constraints"]
+      - file: "py_tools/ai4pcb_harness.py"
+        symbols: ["cmd_feedback_refine"]
+    cli_flags:
+      - "py_tools/ai4pcb_harness.py feedback-refine <work_dir> --corridor-gap 2.8 --local-radius 8.0"
+    baseline_failure: "布线阻塞后只能全板重摆（破坏干净区域）或由 LLM 盲猜调参。"
+    mechanism: "从首轮布线与 route.json 抽取失败网端点 + 高绕行/高过孔热点网格，冻结非热点件，仅在局部半径内加走廊排斥约束做有界退火，并严格按 judge_key(after) < judge_key(before) 决定是否采纳。"
+    rollback: "ai4pcb_harness.py undo 或跳过 feedback-refine。"
+    evidence:
+      experiment_ids: ["EXP-04"]
+      key_deltas:
+        - metric: "l2_blocking_on_congested_b01_seeds"
+          baseline: "seed16=4, seed0=4, seed12=3"
+          treatment: "seed16=3 (-1, vias 35->33, cu 1016->996), seed0=3 (-1), seed12=4"
+        - metric: "full_route_already_clean_b01_seeds"
+          baseline: "blk=0, cu 924..964mm"
+          treatment: "blk=0, cu 954..1032mm (negative if applied to already 0-blocking boards!)"
+    boundaries: "严禁对全量布线已 0 blocking 的板子无条件运行！仅在全量布线 blocking > 0 时触发，并必须由 keep-if-better 门禁保护。"
+    regression_tests: ["tests/test_ai4pcb_physics_and_feedback.py"]
+
+  - id: MOD-S7-01
+    stage: S7
+    name: "heights.py 3D GLB 0° 规范栅格缓存与跨进程文件锁"
+    status: DIAGNOSED_BACKLOG
+    priority: P0
+    risk: MEDIUM
+    code_anchors:
+      - file: "py_placer/placement/heights.py"
+        symbols: ["_key (L1101-1125)", "_measure (L1164-1199)", "_canonical_poses (L1287-1314)"]
+    cli_flags: []
+    baseline_failure: "_key() 将含旋转角的 (pad ...) 原文纳入哈希，导致每个旋转不同的随机种子 0% 命中 ~/.cache/krt_heights；且缺少跨进程锁，6 路并行时同时触发 6 个 1.6GB RAM、45s 的 kicad-cli pcb export glb。"
+    mechanism: "按 (model_path, size, mtime, side) 在 0° 朝向下导出并缓存单件 2D 高度/遮挡栅格，运行时用 NumPy 零开销旋转 0/90/180/270°；冷缓存导出加原子文件锁。"
+    rollback: "保留环境变量 KRT_HEIGHTS_LEGACY_CACHE=1 回退旧键。"
+    evidence:
+      experiment_ids: ["EXP-01 (splitflap s15/s17 393s vs 55s)", "EXP-03 (B1 post-SA 4.5min queue)"]
+      key_deltas:
+        - metric: "18_seed_3d_height_grading_time"
+          baseline: "~13 min (18x GLB exports, ~10GB RAM spikes)"
+          treatment: "Projected <45 s (1x export + NumPy rotation, 5x-10x speedup)"
+    boundaries: "需在旋转栅格与原点对齐上做 22 板 corpus 回归验证（误差 <0.01mm）。"
+    regression_tests: ["TBD: test_heights_rotation_cache.py"]
+
+  - id: MOD-S7-02
+    stage: S7
+    name: "Windows pythonw.exe / conhost.exe 控制台窗口饥饿修复（CREATE_NO_WINDOW）"
+    status: VERIFIED
+    priority: P0
+    risk: LOW
+    code_anchors:
+      - file: "py_tools/ai4pcb_harness.py"
+        symbols: ["_run_cmd (CREATE_NO_WINDOW)"]
+      - file: "py_placer/place_simple.py"
+        symbols: ["subprocess.Popen / subprocess.run (CREATE_NO_WINDOW)"]
+      - file: "py_placer/judge_seeds.py"
+        symbols: ["judge_seed subprocess.run (CREATE_NO_WINDOW)"]
+      - file: "py_placer/placement/heights.py"
+        symbols: ["_measure subprocess.run (CREATE_NO_WINDOW)"]
+    cli_flags: []
+    baseline_failure: "基于 KiCad python.exe 创建的 venv 实际经由 GUI 子系统 pythonw.exe 运行；其派生的子进程若未设置 CREATE_NO_WINDOW，在 Windows 锁屏/高并发下会为每个子进程创建孤立 conhost.exe，积累至 ~45 个后触发窗口站初始化挂死（0.00 CPU / 2.7 MB RAM）。"
+    mechanism: "Windows 环境下所有内部 subprocess 调用显式传入 creationflags=subprocess.CREATE_NO_WINDOW；同时推荐主环境优先使用标准 console Python 3.12（仅 pcbnew 步骤调 KiCad Python）。"
+    rollback: "移除 creationflags 参数。"
+    evidence:
+      experiment_ids: ["Runtime incident 2026-11-25 08:35 (10 stuck conhost processes vs 3s direct console run)"]
+      key_deltas:
+        - metric: "subprocess_startup_under_headless_windows"
+          baseline: "Hung indefinitely at 2.7MB RAM / 0.00 CPU after ~40 conhosts"
+          treatment: "3 s deterministic completion, 0 orphan conhost windows"
+    boundaries: "仅对 Windows (os.name == 'nt') 生效；Linux/macOS 自动忽略。"
+    regression_tests: ["Verified live on Exp03 analog_finish v2"]
+
+symptom_matrix:
+  - symptom: "非 EP SMD 焊盘上出现过孔 (via_in_smd > 0) 或焊盘擦边"
+    mod_ids: ["MOD-S4-01", "MOD-S5-01"]
+    action: "布线加 --same-net-pad-clearance 0.25~0.30；收尾走 analog_finish.py --same-net-smd-clearance 0.25"
+  - symptom: "细间距 IC 触发 starved_thermal，改覆铜又会毁掉 0603 热焊盘"
+    mod_ids: ["MOD-S5-01"]
+    action: "调用 analog_finish.py（外层保持 THERMAL，Pass-2 局部手术刀修复 IC 引脚或给被动件补 0.25mm 短引线+NONE）"
+  - symptom: "双通道精密模拟板 X/Y 不对称、功率电阻离运放太近"
+    mod_ids: ["MOD-S0-01", "MOD-S2-01"]
+    action: "用 compile_board_constraints.py 生成约束并补全 symmetry_pairs，跑 place_simple.py --constraints-json"
+  - symptom: "多 Seed 代理代价第 1 名布线反而很差 / 多个 Seed 长得一模一样"
+    mod_ids: ["MOD-S3-01"]
+    action: "生成 12~18 个候选，使用 --diverse auto --judge 6 + judge_seeds.py --confirm close"
+  - symptom: "强物理约束下不同 Seed 代理代价波动极大"
+    mod_ids: ["MOD-S2-02"]
+    action: "加 --macro-flow 做二次流场温启动（全局摆件勿加过紧 --local-radius）"
+  - symptom: "电源轨或 /CHASSIS 被走成细信号线，或 /V_GP & /V_GN 被误报差分对"
+    mod_ids: ["MOD-S0-01"]
+    action: "用 compile_board_constraints.py 编译 board.yaml，并在 judge_seeds.py 启用 --no-diff-pair-warn"
+  - symptom: "全量布线仍存在 blocking > 0 断线，但不想整板重摆"
+    mod_ids: ["MOD-S6-01"]
+    action: "执行 ai4pcb_harness.py feedback-refine（内置 keep-if-better 防退化门禁）"
+  - symptom: "Windows 并行多 Seed 突然极慢或卡在 2.7MB 0% CPU"
+    mod_ids: ["MOD-S7-01", "MOD-S7-02"]
+    action: "Windows subprocess 启用 CREATE_NO_WINDOW；避免过多并发冷缓存 GLB 导出（P0 待合入 heights.py 0° 缓存）"
+
+experiments:
+  - id: EXP-01
+    date: "2026-11-25"
+    title: "三板全 18-Seed 几何多样性并行择优 Oracle 验证"
+    boards: ["B01_Free (4L)", "B01_Zoned (4L)", "splitflap_driver (2L)"]
+    status: COMPLETED
+    verdict: "STRONG_WIN (6/6 cells beat or tie baseline with --diverse auto; 3/3 boards confirm-close reversal)"
+    artifact: "%LOCALAPPDATA%/ai4pcb_harbor/scratch/ai4pcb_krt_experiments_20261125/exp01_diversity/exp01_complete_3board_summary.json"
+  - id: EXP-02
+    date: "2026-11-25"
+    title: "B01 路线 B 约束编译 + same_net_pad_clearance 扫描 + analog_finish.py"
+    boards: ["B01_Balanced_Receiver (frozen thermal_placed)"]
+    status: COMPLETED
+    verdict: "STRONG_WIN (A3: DRC 0/0/4, via_in_smd 50->0, graze0.3 73->1, bad_therm=0, perim=30, 23.7s)"
+    artifact: "%LOCALAPPDATA%/ai4pcb_harbor/scratch/ai4pcb_krt_experiments_20261125/exp02_routing_dfm_sweep/sweep_v2_summary.json"
+  - id: EXP-03
+    date: "2026-11-25"
+    title: "B01 无手写框 Macro-Flow + 41-Pair 硬对称 + 热隔离三臂配对实验"
+    boards: ["B01_Balanced_Receiver (free-macro, blocks: [])"]
+    status: COMPLETED
+    verdict: "STRONG_WIN (Arm B1 s2 + --clearance 0.22 + analog_finish v3: DRC 0/0, 41-pair sym 0.00mm/0 rot_mis, hot-IC 23.16mm, cu 1190.32mm [-47.4% vs human], EP 4/4/4/4, perim 30, via_in_smd 0, bad_therm 0; Arm B2 macro-flow cut seed cost std -61.6%)"
+    artifact: "%LOCALAPPDATA%/ai4pcb_harbor/scratch/ai4pcb_krt_experiments_20261125/exp03_macro_symmetry_thermal/"
+  - id: EXP-04
+    date: "2026-11-25"
+    title: "拥堵与失败热力图局部回灌精修 A/B"
+    boards: ["B01_Free (seeds 16, 12, 0)", "splitflap_driver (seed 2)"]
+    status: COMPLETED
+    verdict: "CONDITIONAL (L2 blocking reduced 4->3 on 2/3 B01 seeds; negative on already 0-blocking full routes; route_feedback needs quick_score open-net ingestion when route.json failed_single is empty -> gate strictly on blocking>0 + keep-if-better)"
+    artifact: "%LOCALAPPDATA%/ai4pcb_harbor/scratch/ai4pcb_krt_experiments_20261125/exp04_route_feedback/exp04_summary.json"
+  - id: EXP-05
+    date: "2026-11-25"
+    title: "升级版 Harness 独立 GPT 子代理端到端多板实战"
+    boards: ["B01_Balanced_Receiver v2 (4L, Trial 5A)", "ThatMicPre v1 (2L, Trial 5B)"]
+    status: COMPLETED
+    verdict: "DOUBLE_WIN (INDEPENDENTLY VERIFIED): Trial 5A (B01 4L, codex_2) 16m28s vs 65m Astra v1 (4.0x faster), DRC 0/0, 0/5 DFM flaws (vs 5/5), anti-copy mean disp 29.39mm (0/106 <1mm), 38/38 paired 0.000mm, hot-IC 61.46mm, /CHASSIS 0.80mm, ±15V 0.75mm, DUT 0.65mm, EP 4/4/4/4, perim 30; Trial 5B (ThatMicPre 2L, codex_2) 9m02s (placement 183.6s after CREATE_NO_WINDOW fix!), DRC 0/0 (beats human ref 3 errors!), 0 via_in_smd, 0 grazing<=0.30mm, 0 bad_therm, anti-copy mean disp 18.66mm"
+    artifact: "%LOCALAPPDATA%/ai4pcb_harbor/scratch/ai4pcb_krt_experiments_20261125/exp05_agent_trials/"

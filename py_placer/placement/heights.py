@@ -1182,9 +1182,10 @@ def _measure(staged, cli, pcb_data, thickness=_THICKNESS_MM):
             f.write(staged)
         glb = os.path.join(td, 'b.glb')
         try:
+            _extra = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
             r = subprocess.run([cli, 'pcb', 'export', 'glb', '--no-dnp', '--subst-models',
                                 '--no-board-body', '-f', '-o', glb, brd],
-                               capture_output=True, timeout=EXPORT_TIMEOUT_S)
+                               capture_output=True, timeout=EXPORT_TIMEOUT_S, **_extra)
         except subprocess.TimeoutExpired:
             return f'the 3D export timed out after {EXPORT_TIMEOUT_S} s'
         except OSError:

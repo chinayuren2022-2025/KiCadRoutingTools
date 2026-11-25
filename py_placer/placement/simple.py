@@ -1052,6 +1052,10 @@ class Model:
             return h['weight'] * gap
         if h['kind'] == 'within':
             return h['weight'] * max(0.0, gap - h['max_mm'])
+        if h['kind'] == 'apart_min':
+            return h['weight'] * max(0.0, float(h.get('min_mm', APART_MM)) - gap)
+        if h['kind'] == 'symmetry':
+            return h['weight'] * gap
         return h['weight'] * max(0.0, APART_MM - gap)
 
     def _edge_side(self, h):
@@ -1066,6 +1070,15 @@ class Model:
         search: B sits on a grid and each A part looks no further than the
         best gap so far (every pair, when there are few)."""
         P = self.state.parts
+        if h['kind'] == 'symmetry':
+            ra, rb = h['a'][0], h['b'][0]
+            pa, pb = P[ra], P[rb]
+            ex = (pb.x - pa.x) - float(h.get('dx', 0.0))
+            ey = (pb.y - pa.y) - float(h.get('dy', 0.0))
+            drot = abs(((pb.rot - pa.rot) - float(h.get('drot', 0.0))) % 360.0)
+            drot = min(drot, 360.0 - drot) / 90.0
+            err = math.hypot(ex, ey) + float(h.get('rot_weight', 2.0)) * drot
+            return err, (ra, rb)
         if h['kind'] == 'edge':
             side = self._edge_side(h)
             return min((side(P[r].rect()), (r,)) for r in h['a'])
@@ -1114,6 +1127,10 @@ class Model:
         no further away than the committed gap. A witness that moved needs
         the full search."""
         gap, wit = self._hw[h['key']]
+        if h['kind'] == 'symmetry':
+            if h['a'][0] in moving or h['b'][0] in moving:
+                return self._hint_full(h)
+            return gap, wit
         if h.get('pads'):
             # a pad-named link (#1819): measured whole whenever a member moves
             if any(r in moving for r in h['a']) or any(r in moving for r in h['b']):

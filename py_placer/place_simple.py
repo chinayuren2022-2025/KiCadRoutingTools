@@ -238,6 +238,69 @@ def hints(doc, state, movable, args, intent=None):
                         'edge': None, 'weight': LINK_WEIGHT,
                         'max_mm': float(ln['max_mm']), 'link': ln['name'],
                         **({'pads': pads} if pads else {})})
+    # AI4PCB physics constraints JSON: thermal repulsion, geometric symmetry, route-feedback repulsion
+    cpath = getattr(args, 'constraints_json', None)
+    if cpath and os.path.isfile(cpath):
+        cdoc = json.load(open(cpath, encoding='utf-8'))
+        # 1. Thermal separation: hot_refs vs sensitive_refs & hot_refs vs hot_refs
+        therm = cdoc.get('thermal_separation') or {}
+        hot = [r for r in (therm.get('hot_refs') or ()) if r in state.parts]
+        sens = [r for r in (therm.get('sensitive_refs') or ()) if r in state.parts]
+        min_hs = float(therm.get('min_hot_to_sensitive_mm') or 0.0)
+        w_hs = float(therm.get('weight_hot_to_sensitive') or 40.0)
+        if hot and sens and min_hs > 0 and any(r in mov for r in hot + sens):
+            for hr in hot:
+                out.append({
+                    'key': f'thermal_ic:{hr}', 'kind': 'apart_min',
+                    'a': [hr], 'b': sens, 'edge': None,
+                    'min_mm': min_hs, 'weight': w_hs,
+                })
+        min_hh = float(therm.get('min_hot_to_hot_mm') or 0.0)
+        w_hh = float(therm.get('weight_hot_to_hot') or 25.0)
+        if len(hot) >= 2 and min_hh > 0:
+            for i, ha in enumerate(hot):
+                for hb in hot[i + 1:]:
+                    if ha in mov or hb in mov:
+                        out.append({
+                            'key': f'thermal_pair:{ha}:{hb}', 'kind': 'apart_min',
+                            'a': [ha], 'b': [hb], 'edge': None,
+                            'min_mm': min_hh, 'weight': w_hh,
+                        })
+        # 2. Hard geometric symmetry pairs: [[ra, rb], ...] with dx_mm, dy_mm, drot_deg
+        sym_block = cdoc.get('symmetry_pairs') or []
+        sym_meta = cdoc.get('symmetry') or {}
+        sym_dx = float(sym_meta.get('dx_mm', 0.0))
+        sym_dy = float(sym_meta.get('dy_mm', 0.0))
+        sym_drot = float(sym_meta.get('drot_deg', 0.0))
+        sym_w = float(sym_meta.get('weight', 35.0))
+        sym_rw = float(sym_meta.get('rot_weight', 2.5))
+        for item in sym_block:
+            if isinstance(item, dict):
+                ra, rb = item['a'], item['b']
+                dx, dy = float(item.get('dx_mm', sym_dx)), float(item.get('dy_mm', sym_dy))
+                drot = float(item.get('drot_deg', sym_drot))
+                w = float(item.get('weight', sym_w))
+            else:
+                ra, rb = item[0], item[1]
+                dx, dy, drot, w = sym_dx, sym_dy, sym_drot, sym_w
+            if ra in state.parts and rb in state.parts and (ra in mov or rb in mov):
+                out.append({
+                    'key': f'sym:{ra}:{rb}', 'kind': 'symmetry',
+                    'a': [ra], 'b': [rb], 'edge': None,
+                    'dx': dx, 'dy': dy, 'drot': drot,
+                    'rot_weight': sym_rw, 'weight': w,
+                })
+        # 3. Local repulsion hints (e.g. from route_feedback congestion hotspots)
+        for idx, rep in enumerate(cdoc.get('local_repulsion') or ()):
+            ra = [r for r in (rep.get('a') or ()) if r in state.parts]
+            rb = [r for r in (rep.get('b') or ()) if r in state.parts]
+            if ra and rb and any(r in mov for r in ra + rb):
+                out.append({
+                    'key': rep.get('key') or f'repulse:{idx}',
+                    'kind': 'apart_min', 'a': ra, 'b': rb, 'edge': None,
+                    'min_mm': float(rep.get('min_mm', 3.0)),
+                    'weight': float(rep.get('weight', 20.0)),
+                })
     return out
 
 
@@ -259,6 +322,13 @@ def build(pcb, board, doc, base, args, intent=None, blocks=None, fixed=(),
     state = seat_state(pcb, board, intent, blocks, clearance, edge, fixed,
                        estimate_courtyards=True, estimate_skip=estimate_skip)
     movable = sorted(r for r, p in state.parts.items() if not p.locked)
+    mov_only = getattr(args, 'movable_only', None)
+    if mov_only:
+        allow = {r.strip() for r in str(mov_only).split(',') if r.strip()}
+        for r, part in state.parts.items():
+            if r not in allow:
+                part.locked = True
+        movable = sorted(r for r in movable if r in allow)
     # claims: the intent's own, and each crystal at its IC's oscillator pins
     rows, xnotes = claim_rows(pcb, base)
     notes += xnotes
@@ -703,7 +773,8 @@ def _many_seeds(ap, a):
               file=sys.stderr)
         return 2
     skip = {'help', 'board', 'out', 'seed', 'seeds', 'jobs', 'json',
-            'scattered', 'clustered', 'anchored', 'judge', 'plan_checked'}
+            'scattered', 'clustered', 'anchored', 'judge', 'plan_checked',
+            'diverse', 'diverse_cost_cap', 'diverse_quality_weight'}
     passed = []
     for act in ap._actions:
         if act.dest in skip or not act.option_strings:
@@ -747,7 +818,8 @@ def _many_seeds(ap, a):
         while pending and len(live) < jobs:
             s, out, cmd = pending.pop(0)
             log = open(os.path.splitext(out)[0] + '.log', 'w', encoding='utf-8')
-            live.append((s, out, log, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)))
+            _extra = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+            live.append((s, out, log, subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **_extra)))
         fin = [x for x in live if x[3].poll() is not None]
         if not fin:
             time.sleep(0.2)
@@ -960,10 +1032,40 @@ def _name_judged(a, seeds, summaries):
     `baseline` the board the seeds were placed from, which judge_seeds hands
     quick_score so the fast route's score grades assembly the same way)."""
     legal = judge_order({s: summaries[s] for s in seeds if s in summaries})
-    judge = legal[:a.judge]
+    cost_judge = legal[:a.judge]
+    judge = list(cost_judge)
+    diversity_diag = None
+    diverse_mode = getattr(a, 'diverse', 'off') or 'off'
+    out_dir = os.path.dirname(a.out.format(seed=seeds[0])) or '.'
+    if diverse_mode != 'off' and len(legal) > a.judge and a.judge > 0:
+        from placement.diversity import select_diverse_from_run_dir
+        tiers = {}
+        costs_map = {}
+        for s in legal:
+            r = summaries[s]
+            e = (r.get('floorplan') or {}).get('errors')
+            asm = r.get('assembly')
+            b = 0 if asm is None else asm.get('blocking')
+            tiers[s] = (e is None or b is None, (e or 0) + (b or 0))
+            costs_map[s] = float(r['final']['cost'])
+        pat = os.path.basename(a.out) if '{seed}' in os.path.basename(a.out) else 's{seed}.kicad_pcb'
+        judge, diversity_diag = select_diverse_from_run_dir(
+            out_dir,
+            legal,
+            a.judge,
+            mode=diverse_mode,
+            costs=costs_map,
+            tiers=tiers,
+            cost_cap_ratio=getattr(a, 'diverse_cost_cap', 1.20),
+            quality_weight=getattr(a, 'diverse_quality_weight', 0.15),
+            board_pattern=pat,
+        )
     grade = {s: placement_grade(summaries[s]) for s in legal}
     clean_legal = [s for s in legal if grade[s] == 'clean']
     doc = {'judge': judge,
+           'cost_judge': cost_judge,
+           'costs': {str(s): round(float(summaries[s]['final']['cost']), 3)
+                     for s in seeds if s in summaries and 'final' in summaries[s]},
            # the judged seeds graded buildable and floorplan-clean, both
            # counts 0 (#1824); judge_seeds skips a judged seed with either
            # count above 0 unless --seeds names it
@@ -1019,11 +1121,21 @@ def _name_judged(a, seeds, summaries):
                      for s in seeds if s in summaries},
            'baseline': (os.path.abspath(a.board) if getattr(a, 'board', None)
                         else None)}
+    if diversity_diag is not None:
+        doc['diversity'] = diversity_diag
     path = os.path.join(os.path.dirname(a.out.format(seed=seeds[0])), 'judge.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(doc, f, indent=1)
     print(f"place_simple: judge seeds {', '.join(map(str, judge)) or 'none'} "
           f"({judged_counts_text(a.judge, judge, len(legal), grade)}) -> {path}")
+    if diversity_diag is not None:
+        print(f"  diversity ({diversity_diag['mode']}): IC mean pair dist "
+              f"{diversity_diag.get('baseline_ic_mean_mm')} -> "
+              f"{diversity_diag.get('selected_ic_mean_mm')} mm "
+              f"({diversity_diag.get('ic_mean_gain_pct'):+.1f}%), "
+              f"min {diversity_diag.get('baseline_ic_min_mm')} -> "
+              f"{diversity_diag.get('selected_ic_min_mm')} mm; "
+              f"swapped {diversity_diag.get('dropped_seeds')} -> {diversity_diag.get('added_seeds')}")
     of_legal = f"{len(clean_legal)} of {len(legal)} legal seed(s)"
     for s in judge:
         asm = summaries[s].get('assembly') or {}
@@ -1215,6 +1327,27 @@ def build_parser():
                          f'boards: those check_floorplan --intent grades without an error '
                          f'and check_assembly grades buildable first, then by lowest cost '
                          f'(default {JUDGED_SEEDS})')
+    ap.add_argument('--diverse', choices=('off', 'auto', 'farthest', 'medoid'), default='off',
+                    help='select --judge seeds by macro geometric diversity within each '
+                         'quality tier instead of pure final.cost[:k] (auto picks medoid@1.10 '
+                         'when macro spread < 10.5 mm, else farthest@1.20; default: off)')
+    ap.add_argument('--diverse-cost-cap', type=float, default=1.20,
+                    help='with --diverse: max proxy cost ratio vs tier best cost before '
+                         'diversity selection (default: 1.20)')
+    ap.add_argument('--diverse-quality-weight', type=float, default=0.15,
+                    help='with --diverse farthest: tie-break penalty on normalized proxy '
+                         'cost (default: 0.15)')
+    ap.add_argument('--constraints-json', default=None,
+                    help='AI4PCB physics constraints JSON (thermal_separation, symmetry_pairs, '
+                         'local_repulsion) compiled from board.yaml or route_feedback')
+    ap.add_argument('--macro-flow', action='store_true',
+                    help='initialize via deterministic signal-flow quadratic anchor + symmetry alignment')
+    ap.add_argument('--keep-poses', action='store_true',
+                    help='skip scatter and anneal locally from the input board current poses')
+    ap.add_argument('--local-radius', type=float, default=None,
+                    help='clamp every SA part move within MM of its initial pose (local annealing)')
+    ap.add_argument('--movable-only', default=None,
+                    help='comma-separated refs allowed to move; freeze all other parts')
     ap.add_argument('--jobs', type=int, default=0,
                     help='with several seeds, how many run at once (default: one per '
                          'seed, at most 4)')
@@ -1316,12 +1449,13 @@ def _preview(a, argv) -> int:
         doc['blocks'] = list(base.get('blocks') or ()) + blocks
         ipath = os.path.join(td, 'preview_intent.json')
         json.dump(doc, open(ipath, 'w', encoding='utf-8'))
+        _extra = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
         r = subprocess.run(
             [sys.executable, '-X', 'utf8',
              os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'py_tools',
                           'render_placement.py'),
              placed, '--intent', ipath, '--flat', '-o', a.out],
-            capture_output=True, text=True)
+            capture_output=True, text=True, **_extra)
     if r.returncode != 0 or not os.path.exists(a.out):
         print(f"place_simple: the preview render failed: {(r.stderr or r.stdout)[-400:]}",
               file=sys.stderr)
@@ -1674,11 +1808,17 @@ def main(argv=None):
         for k in range(RESTARTS + 1):
             # a restart's own stream, distinct from every other seed's first run
             seed = a.seed if k == 0 else (a.seed + 1) * 1000003 + k
-            simple_anneal.scatter(mdl, movable, seed=seed, clustered=clustered,
-                                  anchored=anchored)
-            res = simple_anneal.anneal(mdl, movable, moves=moves, seed=seed,
-                                       log=lambda s: print(f"  {s}"),
-                                       repair=k == RESTARTS, seats=mdl.edge_seats)
+            if not getattr(a, 'keep_poses', False):
+                simple_anneal.scatter(
+                    mdl, movable, seed=seed, clustered=clustered,
+                    anchored=anchored, macro_flow=getattr(a, 'macro_flow', False),
+                )
+            res = simple_anneal.anneal(
+                mdl, movable, moves=moves, seed=seed,
+                log=lambda s: print(f"  {s}"),
+                repair=k == RESTARTS, seats=mdl.edge_seats,
+                local_radius_mm=getattr(a, 'local_radius', None),
+            )
             passes.append({'pass': label, 'run': k + 1, 'moves': res['moves'],
                            'seconds': res['seconds']})
             illegal = [r for r in movable if not ok(r, st, mdl)]

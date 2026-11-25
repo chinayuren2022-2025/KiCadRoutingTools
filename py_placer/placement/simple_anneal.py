@@ -165,10 +165,14 @@ def turns_alike(part, fp) -> bool:
 
 
 class Annealer:
-    def __init__(self, model, movable: List[str], *, seed: int = 0, seats=None):
+    def __init__(self, model, movable: List[str], *, seed: int = 0, seats=None,
+                 local_radius_mm: float | None = None):
         self.model = model
         self.st = model.state
         st = self.st
+        self.local_radius = (float(local_radius_mm)
+                             if local_radius_mm is not None and float(local_radius_mm) > 0
+                             else None)
         # parts held on a board edge (`edge_seat`): a move only slides them
         # along it, or turns one with no mating face
         self.seats = dict(seats or {})
@@ -257,6 +261,17 @@ class Annealer:
         self.lam = LAM_START
         self.shoving = False        # an escape may shove: only in `repair`
         self.local = False          # ... and only shove, never jump: `legalise`
+        self.home = {r: (st.parts[r].x, st.parts[r].y) for r in self.mov}
+        # Coupled symmetry partners from `symmetry` hints (AI4PCB fork)
+        self.sym_partner: Dict[str, Tuple[str, float, float, float]] = {}
+        for h in getattr(model, 'hints', ()) or ():
+            if h.get('kind') == 'symmetry' and h.get('a') and h.get('b'):
+                ra, rb = h['a'][0], h['b'][0]
+                dx, dy = float(h.get('dx', 0.0)), float(h.get('dy', 0.0))
+                drot = float(h.get('drot', 0.0))
+                if ra in self.movset and rb in self.movset:
+                    self.sym_partner[ra] = (rb, dx, dy, drot)
+                    self.sym_partner[rb] = (ra, -dx, -dy, -drot)
         # #1443: the parts with room under them (`QuenchState.covers`)
         self.cover_list = sorted(r for r in st.covers if r not in self.containers)
 
@@ -735,11 +750,13 @@ class Annealer:
     def kinds(self) -> List[str]:
         """The move kinds this board can make."""
         out = [k for k in MOVES if k not in ('swap', 'gshift', 'gturn', 'gswap')]
-        if any(self.twins.values()):
+        if self.local_radius is not None and 'jump' in out:
+            out.remove('jump')
+        if any(self.twins.values()) and self.local_radius is None:
             out.append('swap')
         if self.groups:
             out += ['gshift', 'gturn']
-        if len(self.free_groups) >= 2:
+        if len(self.free_groups) >= 2 and self.local_radius is None:
             out.append('gswap')
         return [k for k in MOVES if k in out]
 
@@ -751,6 +768,30 @@ class Annealer:
             return new
         if kind in CARRY:
             new = self._carry(new)
+        # Coupled symmetry partner move (75% paired, 25% independent for fine legalisation)
+        if self.sym_partner and kind in ('shift', 'turn', 'dock', 'gshift') and self.rng.random() < 0.75:
+            extras = {}
+            for r, (x, y, rot) in new.items():
+                if r in self.sym_partner:
+                    partner, dx, dy, drot = self.sym_partner[r]
+                    if partner not in new and partner not in extras and partner not in self.seats:
+                        extras[partner] = (x + dx, y + dy, (rot + drot) % 360.0)
+            if extras:
+                new = {**new, **extras}
+        # Local-radius clamping around macro initial home pose when --local-radius is set
+        if self.local_radius is not None:
+            rad = self.local_radius
+            clamped = {}
+            for r, (x, y, rot) in new.items():
+                if r in self.home and r not in self.seats:
+                    hx, hy = self.home[r]
+                    ddx, ddy = x - hx, y - hy
+                    dist = math.hypot(ddx, ddy)
+                    if dist > rad:
+                        scale = rad / dist
+                        x, y = hx + ddx * scale, hy + ddy * scale
+                clamped[r] = (x, y, rot)
+            new = clamped
         out = {r: v for r, v in new.items() if r not in self.seats}
         rs = []
         for r, (x, y, rot) in out.items():
@@ -1279,14 +1320,15 @@ def _anchors(model, movable: List[str], rng, inner) -> Tuple[List[List[str]], np
 
 
 def scatter(model, movable: List[str], seed: int = 0, clustered: bool = False,
-            anchored: bool = False):
+            anchored: bool = False, macro_flow: bool = False):
     """Every movable part at a random place on the board (less its edge
     margin), at its present turn: the start, a part's neighbourhood local
     from the first move. `clustered` then gathers each group's movable
     members round one random point, in a square of their courtyards' area,
     so the anneal arranges whole groups from the first move. `anchored`
     gathers them round the point its wiring prefers instead (`_anchors`),
-    each part in no group set at its own."""
+    each part in no group set at its own. `macro_flow` solves a low-jitter
+    quadratic signal-flow layout and aligns declared symmetry pairs upfront."""
     st = model.state
     rng = random.Random(seed)
     inner = tuple(st.usable)
@@ -1297,12 +1339,22 @@ def scatter(model, movable: List[str], seed: int = 0, clustered: bool = False,
         x = rng.uniform(inner[0] + w / 2, max(inner[0] + w / 2, inner[2] - w / 2))
         y = rng.uniform(inner[1] + h / 2, max(inner[1] + h / 2, inner[3] - h / 2))
         _place(st, r, p.x + x - (c[0] + c[2]) / 2.0, p.y + y - (c[1] + c[3]) / 2.0, p.rot)
-    if anchored:
-        nodes, centres = _anchors(model, movable, rng, inner)
+    if macro_flow or anchored:
+        # macro_flow uses tight quadratic signal-flow pinning with minimal random scatter
+        global ANCHOR_SPREAD, ANCHOR_JITTER
+        old_s, old_j = ANCHOR_SPREAD, ANCHOR_JITTER
+        if macro_flow:
+            ANCHOR_SPREAD, ANCHOR_JITTER = 0.12, 0.04
+        try:
+            nodes, centres = _anchors(model, movable, rng, inner)
+        finally:
+            ANCHOR_SPREAD, ANCHOR_JITTER = old_s, old_j
         for m, (gx, gy) in zip(nodes, centres):
             area = sum((q[2] - q[0]) * (q[3] - q[1]) for q in (st.parts[r].rect() for r in m))
             half = min(math.sqrt(area) / 2.0, (inner[2] - inner[0]) / 2.0,
                        (inner[3] - inner[1]) / 2.0)
+            if macro_flow:
+                half *= 0.75
             gx = min(max(gx, inner[0] + half), inner[2] - half)
             gy = min(max(gy, inner[1] + half), inner[3] - half)
             for r in m:
@@ -1311,6 +1363,31 @@ def scatter(model, movable: List[str], seed: int = 0, clustered: bool = False,
                 x, y = (gx, gy) if len(m) == 1 else (gx + rng.uniform(-half, half),
                                                      gy + rng.uniform(-half, half))
                 _place(st, r, p.x + x - (c[0] + c[2]) / 2.0, p.y + y - (c[1] + c[3]) / 2.0, p.rot)
+        if macro_flow:
+            # Symmetrize declared partner pairs around their midpoint right from move 0
+            mov_set = set(movable)
+            seen_sym = set()
+            for h in getattr(model, 'hints', ()) or ():
+                if h.get('kind') != 'symmetry':
+                    continue
+                ra, rb = h['a'][0], h['b'][0]
+                if ra in seen_sym or rb in seen_sym or ra not in mov_set or rb not in mov_set:
+                    continue
+                seen_sym.update((ra, rb))
+                pa, pb = st.parts[ra], st.parts[rb]
+                dx, dy = float(h.get('dx', 0.0)), float(h.get('dy', 0.0))
+                drot = float(h.get('drot', 0.0))
+                mx, my = 0.5 * (pa.x + pb.x), 0.5 * (pa.y + pb.y)
+                ax, ay = mx - 0.5 * dx, my - 0.5 * dy
+                bx, by = mx + 0.5 * dx, my + 0.5 * dy
+                # Clamp pair inside inner bounds together
+                pad_m = 2.0
+                sx = max(0.0, (inner[0] + pad_m) - min(ax, bx)) - max(0.0, max(ax, bx) - (inner[2] - pad_m))
+                sy = max(0.0, (inner[1] + pad_m) - min(ay, by)) - max(0.0, max(ay, by) - (inner[3] - pad_m))
+                rot_b = (pa.rot + drot) % 360.0
+                pb.ensure_rotation(rot_b)
+                _place(st, ra, ax + sx, ay + sy, pa.rot)
+                _place(st, rb, bx + sx, by + sy, rot_b)
     elif clustered:
         mov = set(movable)
         for _n, members in model.groups:
@@ -1339,7 +1416,8 @@ def scatter(model, movable: List[str], seed: int = 0, clustered: bool = False,
 
 
 def anneal(model, movable: List[str], *, moves: int = 11000,
-           seed: int = 0, log=None, repair: bool = False, seats=None) -> Dict:
+           seed: int = 0, log=None, repair: bool = False, seats=None,
+           local_radius_mm: float | None = None) -> Dict:
     """Anneal from the live poses and leave the best overlap-free placement
     seen applied, each part then held to the exact legality. With `repair`,
     a run that never came clean is first mended where it stands
@@ -1348,7 +1426,7 @@ def anneal(model, movable: List[str], *, moves: int = 11000,
     'tracked_best', 't0', 'stats': {kind: (tried, kept)},
     'reseated' (parts moved to their nearest legal pose afterwards),
     'repaired' (the run never came clean and `Annealer.repair` mended it)}."""
-    a = Annealer(model, movable, seed=seed, seats=seats)
+    a = Annealer(model, movable, seed=seed, seats=seats, local_radius_mm=local_radius_mm)
     st = model.state
     for r, seat in a.seats.items():     # back on its edge after the scatter
         p = st.parts[r]
@@ -1360,7 +1438,7 @@ def anneal(model, movable: List[str], *, moves: int = 11000,
     model.total()               # ... and the index and grids with them
     t0 = a.start_temperature()
     kinds = a.kinds()
-    reach0 = a.span / 6.0
+    reach0 = a.span / 6.0 if a.local_radius is None else min(a.span / 6.0, a.local_radius)
     late = int(BIG_UNTIL * moves)       # from here no group turns or swaps
     run = {'done': 0}                   # moves executed
     stats = {k: [0, 0] for k in kinds}
